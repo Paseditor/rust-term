@@ -169,6 +169,59 @@ pub fn parse_decimal(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+pub fn parse_tail(text: &str, format: Format) -> Result<Vec<u8>, String> {
+    match format {
+        Format::Hex => {
+            let compact: String = text
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '$')
+                .collect();
+            if !compact.len().is_multiple_of(2) || !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("Неверное HEX-окончание: {text}"));
+            }
+            compact
+                .as_bytes()
+                .chunks(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).expect("ascii hex"), 16)
+                        .map_err(|_| format!("Неверное HEX-окончание: {text}"))
+                })
+                .collect()
+        }
+        Format::Decimal => Ok(text
+            .split_whitespace()
+            .map(|token| {
+                token
+                    .parse::<i64>()
+                    .map(|value| (value & 0xFF) as u8)
+                    .unwrap_or(0)
+            })
+            .collect()),
+        Format::Text => {
+            let mut bytes = Vec::new();
+            let mut rest = text;
+            while !rest.is_empty() {
+                let raw = rest.as_bytes();
+                if raw.len() >= 3
+                    && raw[0] == b'$'
+                    && raw[1].is_ascii_hexdigit()
+                    && raw[2].is_ascii_hexdigit()
+                {
+                    bytes.push(u8::from_str_radix(&rest[1..3], 16).expect("hex digits checked"));
+                    rest = &rest[3..];
+                } else {
+                    let ch = rest.chars().next().expect("non-empty");
+                    bytes.extend_from_slice(
+                        &crate::text::Encoding::Windows1251.encode(&ch.to_string())?,
+                    );
+                    rest = &rest[ch.len_utf8()..];
+                }
+            }
+            Ok(bytes)
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn parse_command_file(
     text: &str,
@@ -214,14 +267,18 @@ pub fn parse_with_format(
     lists: &[CommandList],
     encoding: crate::text::Encoding,
 ) -> Result<Vec<Step>, String> {
+    struct ParseState {
+        stack: Vec<u16>,
+        pending_tail: Option<Vec<u8>>,
+        steps: Vec<Step>,
+    }
     fn expand(
         text: &str,
         format: Format,
         suffix: &[u8],
         base: &Path,
         context: (&[CommandList], crate::text::Encoding),
-        stack: &mut Vec<u16>,
-        steps: &mut Vec<Step>,
+        state: &mut ParseState,
     ) -> Result<(), String> {
         for (index, line) in text.lines().enumerate() {
             if let Some(number) = line.trim().strip_prefix("[sendcmdlist:]") {
@@ -235,7 +292,7 @@ pub fn parse_with_format(
                         index + 1
                     ));
                 }
-                if stack.contains(&number) || stack.len() >= 32 {
+                if state.stack.contains(&number) || state.stack.len() >= 32 {
                     return Err(format!(
                         "Циклический или слишком глубокий вызов списка {number}"
                     ));
@@ -247,7 +304,7 @@ pub fn parse_with_format(
                 if matching.next().is_some() {
                     return Err(format!("Номер списка {number} повторяется"));
                 }
-                stack.push(number);
+                state.stack.push(number);
                 let format = if list.decimal {
                     Format::Decimal
                 } else if list.hex {
@@ -255,31 +312,34 @@ pub fn parse_with_format(
                 } else {
                     Format::Text
                 };
-                expand(&list.text, format, suffix, base, context, stack, steps)?;
-                stack.pop();
+                expand(&list.text, format, suffix, base, context, state)?;
+                state.stack.pop();
             } else {
-                steps.extend(
-                    parse_lines(line, format, suffix, base, context.1)
-                        .map_err(|error| format!("Строка {}: {error}", index + 1))?,
+                state.steps.extend(
+                    parse_lines(
+                        line,
+                        format,
+                        suffix,
+                        base,
+                        context.1,
+                        &mut state.pending_tail,
+                    )
+                    .map_err(|error| format!("Строка {}: {error}", index + 1))?,
                 );
             }
-            if steps.len() > 100_000 {
+            if state.steps.len() > 100_000 {
                 return Err("Сценарий содержит более 100000 команд".into());
             }
         }
         Ok(())
     }
-    let mut steps = Vec::new();
-    expand(
-        text,
-        format,
-        suffix,
-        base,
-        (lists, encoding),
-        &mut Vec::new(),
-        &mut steps,
-    )?;
-    Ok(steps)
+    let mut state = ParseState {
+        stack: Vec::new(),
+        pending_tail: None,
+        steps: Vec::new(),
+    };
+    expand(text, format, suffix, base, (lists, encoding), &mut state)?;
+    Ok(state.steps)
 }
 
 fn parse_lines(
@@ -288,6 +348,7 @@ fn parse_lines(
     suffix: &[u8],
     base: &Path,
     encoding: crate::text::Encoding,
+    pending_tail: &mut Option<Vec<u8>>,
 ) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -330,13 +391,20 @@ fn parse_lines(
                 return Err(format!("Строка {}: слишком большая задержка", index + 1));
             }
             steps.push(Step::Delay(delay));
+        } else if let Some(tail) = line.trim().strip_prefix("[tail:]") {
+            let bytes = if tail.trim().is_empty() {
+                Vec::new()
+            } else {
+                parse_hex(tail).map_err(|error| format!("Строка {}: {error}", index + 1))?
+            };
+            *pending_tail = Some(bytes);
         } else {
             let mut bytes = match format {
                 Format::Hex => parse_hex(line)?,
                 Format::Decimal => parse_decimal(line)?,
                 Format::Text => encoding.encode(line)?,
             };
-            bytes.extend_from_slice(suffix);
+            bytes.extend_from_slice(pending_tail.take().as_deref().unwrap_or(suffix));
             steps.push(Step::Send(bytes));
         }
     }
@@ -608,5 +676,63 @@ mod tests {
         script.file_finished();
         script.response_received();
         assert_eq!(script.next(now, false).unwrap(), Some(Step::Send(vec![2])));
+    }
+    #[test]
+    fn tail_directive_overrides_suffix_once() {
+        assert_eq!(
+            parse_command_file("[tail:]0D\nAT\nPING\n", false, b"\r\n", Path::new(".")).unwrap(),
+            vec![
+                Step::Send(b"AT\r".to_vec()),
+                Step::Send(b"PING\r\n".to_vec())
+            ]
+        );
+    }
+    #[test]
+    fn empty_tail_directive_suppresses_suffix() {
+        assert_eq!(
+            parse_command_file("[tail:]\nAT\nPING\n", false, b"\r\n", Path::new(".")).unwrap(),
+            vec![Step::Send(b"AT".to_vec()), Step::Send(b"PING\r\n".to_vec())]
+        );
+    }
+    #[test]
+    fn tail_directive_rejects_invalid_hex() {
+        assert!(parse_command_file("[tail:]0G\nAT", false, &[], Path::new(".")).is_err());
+        assert!(parse_command_file("[tail:]0D0\nAT", false, &[], Path::new(".")).is_err());
+    }
+    #[test]
+    fn tail_directive_works_in_hex_and_decimal_modes() {
+        assert_eq!(
+            parse_command_file("[tail:]0D 0A\n41 42\n", true, b"\r\n", Path::new(".")).unwrap(),
+            vec![Step::Send(vec![0x41, 0x42, 0x0D, 0x0A])]
+        );
+        assert_eq!(
+            parse_with_format(
+                "[tail:]0D\n65 66\n",
+                Format::Decimal,
+                b"\r\n",
+                Path::new("."),
+                &[],
+                crate::text::Encoding::Utf8,
+            )
+            .unwrap(),
+            vec![Step::Send(vec![65, 66, 0x0D])]
+        );
+    }
+    #[test]
+    fn parse_tail_converts_all_formats() {
+        assert_eq!(parse_tail("$0D$0A", Format::Text).unwrap(), b"\r\n");
+        assert_eq!(parse_tail("T$0D", Format::Text).unwrap(), b"T\r");
+        assert_eq!(parse_tail("Ж", Format::Text).unwrap(), [0xC6]);
+        assert_eq!(parse_tail("0D0A", Format::Hex).unwrap(), b"\r\n");
+        assert_eq!(parse_tail("$0D $0A", Format::Hex).unwrap(), b"\r\n");
+        assert_eq!(parse_tail("13 10", Format::Decimal).unwrap(), b"\r\n");
+        assert_eq!(
+            parse_tail("256 -1 x", Format::Decimal).unwrap(),
+            [0, 255, 0]
+        );
+        assert!(parse_tail("0", Format::Hex).is_err());
+        assert!(parse_tail("ZZ", Format::Hex).is_err());
+        assert_eq!(parse_tail("", Format::Text).unwrap(), b"");
+        assert_eq!(parse_tail("", Format::Hex).unwrap(), b"");
     }
 }

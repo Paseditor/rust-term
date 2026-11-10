@@ -7,6 +7,7 @@ mod extra;
 mod framing;
 mod generator;
 mod legacy;
+mod numgen;
 mod parser;
 mod protocol;
 mod scheduler;
@@ -49,6 +50,9 @@ struct Config {
     settings: Settings,
     auto_connect: bool,
     auto_reconnect: bool,
+    send_on_connect: bool,
+    send_on_select: bool,
+    byte_by_byte: bool,
     macros: Vec<Macro>,
     command_lists: Vec<protocol::CommandList>,
     custom_table: Vec<String>,
@@ -58,6 +62,8 @@ struct Config {
     frame_length: usize,
     idle_ms: u64,
     frame_sequence: Vec<u8>,
+    frame_sequence2: Vec<u8>,
+    frame_combined: framing::Combined,
     invert_bits: bool,
     reverse_bits: bool,
     send_checksum: checksum::Kind,
@@ -75,6 +81,10 @@ struct Config {
     generator_random: bool,
     generator_min_length: usize,
     generator_max_length: usize,
+    numgen_mode: numgen::Mode,
+    numgen_params: numgen::Params,
+    auto_log: bool,
+    auto_log_dir: String,
     profiles: Vec<Profile>,
 }
 impl Default for Config {
@@ -83,6 +93,9 @@ impl Default for Config {
             settings: Settings::default(),
             auto_connect: false,
             auto_reconnect: false,
+            send_on_connect: false,
+            send_on_select: false,
+            byte_by_byte: false,
             macros: Vec::new(),
             command_lists: Vec::new(),
             custom_table: vec![String::new(); 256],
@@ -92,6 +105,8 @@ impl Default for Config {
             frame_length: 256,
             idle_ms: 20,
             frame_sequence: vec![0x0d, 0x0a],
+            frame_sequence2: vec![0x0d, 0x0a],
+            frame_combined: framing::Combined::default(),
             invert_bits: false,
             reverse_bits: false,
             send_checksum: checksum::Kind::None,
@@ -109,6 +124,10 @@ impl Default for Config {
             generator_random: false,
             generator_min_length: 0,
             generator_max_length: 0,
+            numgen_mode: numgen::Mode::Random,
+            numgen_params: numgen::Params::default(),
+            auto_log: false,
+            auto_log_dir: String::new(),
             profiles: Vec::new(),
         }
     }
@@ -127,6 +146,13 @@ struct Profile {
 enum ProfileAction {
     Apply(String),
     Delete(String),
+}
+enum ImportKind {
+    AddCmd,
+    ListConfig,
+    OldCmdList,
+    Macros,
+    Settings,
 }
 struct Record {
     time: String,
@@ -279,6 +305,7 @@ struct Terminal {
     framer: framing::Framer,
     text_decoders: HashMap<(String, bool), text::Decoder>,
     sequence_edit: String,
+    sequence2_edit: String,
     show_parser: bool,
     parser_values: Vec<Option<(String, String)>>,
     parser_history: Vec<VecDeque<f64>>,
@@ -319,6 +346,13 @@ struct Terminal {
     compare_result: Option<Result<compare::ResultSummary, String>>,
     generator: Option<generator::Generator>,
     macro_name: String,
+    show_fast_send: bool,
+    fast_send_text: String,
+    fast_send_baseline: String,
+    show_numgen: bool,
+    numgen_result: String,
+    show_import: bool,
+    import_status: String,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -375,6 +409,12 @@ impl Terminal {
                 "Некорректный разделитель в настройках; исходный файл не будет перезаписан".into(),
             );
         }
+        if config.frame_sequence2.len() > 64 {
+            config.frame_sequence2 = vec![0x0d, 0x0a];
+            config_error = Some(
+                "Некорректный разделитель в настройках; исходный файл не будет перезаписан".into(),
+            );
+        }
         if config.custom_table.len() != 256
             || config.custom_presets.len() > 32
             || config
@@ -400,7 +440,10 @@ impl Terminal {
         );
         let mut framer = framing::Framer::new(config.framing, config.frame_length, config.idle_ms);
         framer.set_sequence(&config.frame_sequence);
+        framer.set_sequence2(&config.frame_sequence2);
+        framer.set_combined(config.frame_combined);
         let sequence_edit = protocol::hex(&config.frame_sequence);
+        let sequence2_edit = protocol::hex(&config.frame_sequence2);
         let extras = config
             .extra_ports
             .iter()
@@ -413,6 +456,7 @@ impl Terminal {
                     config.idle_ms,
                     &config.frame_sequence,
                 )
+                .with_framing(config.frame_combined, &config.frame_sequence2)
             })
             .collect();
         Self {
@@ -457,6 +501,7 @@ impl Terminal {
             framer,
             text_decoders: HashMap::new(),
             sequence_edit,
+            sequence2_edit,
             show_parser: false,
             parser_values: Vec::new(),
             parser_history: Vec::new(),
@@ -497,6 +542,13 @@ impl Terminal {
             compare_result: None,
             generator: None,
             macro_name: String::new(),
+            show_fast_send: false,
+            fast_send_text: String::new(),
+            fast_send_baseline: String::new(),
+            show_numgen: false,
+            numgen_result: String::new(),
+            show_import: false,
+            import_status: String::new(),
         }
     }
     fn refresh_ports(&mut self) {
@@ -538,7 +590,8 @@ impl Terminal {
         }
     }
     fn idle_gap(&self) -> Option<Duration> {
-        (self.config.framing == framing::Mode::Idle)
+        (self.config.framing == framing::Mode::Idle
+            || (self.config.framing == framing::Mode::Combined && self.config.frame_combined.idle))
             .then(|| Duration::from_millis(self.config.idle_ms.clamp(1, 60_000)))
     }
     fn send(&mut self, mut bytes: Vec<u8>) -> bool {
@@ -616,6 +669,121 @@ impl Terminal {
             }
         }
     }
+    fn select_command(&mut self, text: String, hex: bool, decimal: bool) {
+        self.input = text;
+        self.send_hex = hex;
+        self.send_decimal = decimal;
+        if self.config.send_on_select {
+            self.send_input();
+        }
+    }
+    fn send_manual(&mut self) {
+        if !self.config.byte_by_byte {
+            self.send_input();
+            return;
+        }
+        match self.take_first_unit() {
+            Ok(bytes) => {
+                if !self.send(bytes) {
+                    self.periodic = false;
+                }
+            }
+            Err(e) => {
+                self.periodic = false;
+                self.error = Some(e);
+            }
+        }
+    }
+    fn take_first_unit(&mut self) -> Result<Vec<u8>, String> {
+        if self.send_hex || self.send_decimal {
+            let text = self.input.trim_start();
+            let end = text.find(char::is_whitespace).unwrap_or(text.len());
+            if end == 0 {
+                return Err("Нет данных для отправки".into());
+            }
+            let bytes = if self.send_decimal {
+                protocol::parse_decimal(&text[..end])?
+            } else {
+                protocol::parse_hex(&text[..end])?
+            };
+            self.input = text[end..].trim_start().to_string();
+            Ok(bytes)
+        } else {
+            let Some(ch) = self.input.chars().next() else {
+                return Err("Нет данных для отправки".into());
+            };
+            let bytes = self.config.send_encoding.encode(&ch.to_string())?;
+            self.input.drain(..ch.len_utf8());
+            Ok(bytes)
+        }
+    }
+    fn flush_fast_send(&mut self) {
+        if self.fast_send_text.len() > 500_000 {
+            self.fast_send_text.clear();
+        }
+        let pending = if self.fast_send_text.starts_with(&self.fast_send_baseline) {
+            self.fast_send_text[self.fast_send_baseline.len()..].to_string()
+        } else {
+            self.fast_send_baseline = self.fast_send_text.clone();
+            String::new()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        if !self.connected {
+            self.fast_send_baseline = self.fast_send_text.clone();
+            return;
+        }
+        if self.write_pending
+            || self.script.active()
+            || self.generator.is_some()
+            || self.file_transfer.is_some()
+        {
+            return;
+        }
+        match self.config.send_encoding.encode(&pending) {
+            Ok(bytes) if !bytes.is_empty() => {
+                if self.send(bytes) {
+                    self.fast_send_baseline = self.fast_send_text.clone();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.fast_send_baseline = self.fast_send_text.clone();
+                self.error = Some(e);
+            }
+        }
+    }
+    fn fast_send_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_fast_send;
+        egui::Window::new("Быстрая отправка")
+            .open(&mut open)
+            .default_width(420.0)
+            .default_height(280.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Каждый новый символ сразу отправляется в порт без окончания и контрольной суммы",
+                    )
+                    .color(MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.fast_send_text)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.button("Очистить").clicked() {
+                    self.fast_send_text.clear();
+                }
+            });
+        self.show_fast_send = open;
+        if open {
+            self.flush_fast_send();
+        } else {
+            self.fast_send_baseline = self.fast_send_text.clone();
+        }
+    }
     fn receive_events(&mut self) {
         let port = self.config.settings.port.clone();
         let events: Vec<_> = self
@@ -628,6 +796,12 @@ impl Terminal {
                 Event::Connected => {
                     self.connected = true;
                     self.last_connection_error = None;
+                    self.open_auto_log(&port);
+                    if self.config.send_on_connect
+                        && (!self.input.is_empty() || !self.suffix_bytes().is_empty())
+                    {
+                        self.send_input();
+                    }
                 }
                 Event::Received(mut bytes, at) => {
                     self.rx += bytes.len() as u64;
@@ -899,6 +1073,42 @@ impl Terminal {
         self.error = Some(format!(
             "Эмулятор остановлен: порт {port} отключён до отправки ответа"
         ));
+    }
+    fn open_auto_log(&mut self, port: &str) {
+        if !self.config.auto_log || self.log.is_some() {
+            return;
+        }
+        let dir = if self.config.auto_log_dir.is_empty() {
+            config_path()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("logs")
+        } else {
+            PathBuf::from(&self.config.auto_log_dir)
+        };
+        if let Err(e) = fs::create_dir_all(&dir) {
+            self.error = Some(format!("Не удалось создать каталог журнала: {e}"));
+            return;
+        }
+        let safe_port: String = port
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let name = format!(
+            "RustTerm_{}_{}.log",
+            Local::now().format("%Y%m%d_%H%M%S"),
+            safe_port
+        );
+        let path = dir.join(name);
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                self.log = Some(file);
+                self.log_path = Some(path);
+            }
+            Err(e) => {
+                self.error = Some(format!("Не удалось открыть журнал {}: {e}", path.display()));
+            }
+        }
     }
     fn write_log(&mut self, port: &str, outgoing: bool, bytes: &[u8]) {
         let time = Local::now().format("%H:%M:%S%.3f").to_string();
@@ -1380,6 +1590,57 @@ impl Terminal {
         }
         Ok(())
     }
+    fn apply_sequence2(&mut self) -> Result<(), String> {
+        let sequence = if self.sequence2_edit.trim().is_empty() {
+            Vec::new()
+        } else {
+            protocol::parse_hex(&self.sequence2_edit)?
+        };
+        if sequence.len() > 64 {
+            return Err("Разделитель должен содержать не более 64 байтов".into());
+        }
+        self.config.frame_sequence2 = sequence;
+        self.sequence2_edit = protocol::hex(&self.config.frame_sequence2);
+        self.last_display.clear();
+        let port = self.config.settings.port.clone();
+        if let Some(frame) = self.framer.set_sequence2(&self.config.frame_sequence2) {
+            self.display_record(&port, false, frame.bytes, true);
+        }
+        let remainder: Vec<_> = self
+            .extras
+            .iter_mut()
+            .filter_map(|extra| {
+                extra
+                    .framer
+                    .set_sequence2(&self.config.frame_sequence2)
+                    .map(|frame| (extra.settings.port.clone(), frame))
+            })
+            .collect();
+        for (port, frame) in remainder {
+            self.display_record(&port, false, frame.bytes, true);
+        }
+        Ok(())
+    }
+    fn apply_combined(&mut self) {
+        self.last_display.clear();
+        let port = self.config.settings.port.clone();
+        if let Some(frame) = self.framer.set_combined(self.config.frame_combined) {
+            self.display_record(&port, false, frame.bytes, true);
+        }
+        let remainder: Vec<_> = self
+            .extras
+            .iter_mut()
+            .filter_map(|extra| {
+                extra
+                    .framer
+                    .set_combined(self.config.frame_combined)
+                    .map(|frame| (extra.settings.port.clone(), frame))
+            })
+            .collect();
+        for (port, frame) in remainder {
+            self.display_record(&port, false, frame.bytes, true);
+        }
+    }
     fn apply_profile(&mut self, name: &str) -> Result<(), String> {
         if self.connection.is_some()
             || self.connection_desired
@@ -1397,6 +1658,9 @@ impl Terminal {
             .cloned()
             .ok_or("Набор настроек не найден")?;
         if profile.config.frame_sequence.is_empty() || profile.config.frame_sequence.len() > 64 {
+            return Err("В наборе указан некорректный разделитель".into());
+        }
+        if profile.config.frame_sequence2.len() > 64 {
             return Err("В наборе указан некорректный разделитель".into());
         }
         if profile.config.custom_table.len() != 256
@@ -1424,7 +1688,10 @@ impl Terminal {
             self.config.idle_ms,
         );
         self.framer.set_sequence(&self.config.frame_sequence);
+        self.framer.set_sequence2(&self.config.frame_sequence2);
+        self.framer.set_combined(self.config.frame_combined);
         self.sequence_edit = protocol::hex(&self.config.frame_sequence);
+        self.sequence2_edit = protocol::hex(&self.config.frame_sequence2);
         self.extras = self
             .config
             .extra_ports
@@ -1438,6 +1705,7 @@ impl Terminal {
                     self.config.idle_ms,
                     &self.config.frame_sequence,
                 )
+                .with_framing(self.config.frame_combined, &self.config.frame_sequence2)
             })
             .collect();
         self.text_decoders.clear();
@@ -2250,12 +2518,300 @@ impl Terminal {
             }
         }
     }
+    fn numgen_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_numgen;
+        let mut generate = false;
+        let mut to_input = false;
+        let mut copy = false;
+        let mut save_file = false;
+        egui::Window::new("Генератор чисел")
+            .open(&mut open)
+            .default_width(560.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.config.numgen_mode,
+                        numgen::Mode::Random,
+                        "Случайные",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.numgen_mode,
+                        numgen::Mode::Sequential,
+                        "Последовательные",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.numgen_mode,
+                        numgen::Mode::Sinusoid,
+                        "Синусоида",
+                    );
+                    ui.selectable_value(
+                        &mut self.config.numgen_mode,
+                        numgen::Mode::Triangular,
+                        "Треугольные",
+                    );
+                });
+                {
+                    let params = &mut self.config.numgen_params;
+                    ui.horizontal(|ui| {
+                        ui.label("Минимум");
+                        ui.add(egui::DragValue::new(&mut params.min));
+                        ui.label("Максимум");
+                        ui.add(egui::DragValue::new(&mut params.max));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Количество");
+                        ui.add(egui::DragValue::new(&mut params.cnt).range(1..=100_000));
+                        ui.label("Колонок");
+                        ui.add(egui::DragValue::new(&mut params.col).range(1..=100));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Вычитать");
+                        ui.add(egui::DragValue::new(&mut params.sub));
+                        ui.label("Разделитель");
+                        ui.add(egui::TextEdit::singleline(&mut params.tail).desired_width(60.0));
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Сгенерировать").clicked() {
+                        generate = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.numgen_result.is_empty(),
+                            egui::Button::new("В поле ввода"),
+                        )
+                        .clicked()
+                    {
+                        to_input = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.numgen_result.is_empty(),
+                            egui::Button::new("Копировать"),
+                        )
+                        .clicked()
+                    {
+                        copy = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.numgen_result.is_empty(),
+                            egui::Button::new("Сохранить…"),
+                        )
+                        .clicked()
+                    {
+                        save_file = true;
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.numgen_result)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("Результат появится здесь"),
+                        );
+                    });
+            });
+        self.show_numgen = open;
+        if generate {
+            match numgen::generate(
+                self.config.numgen_mode,
+                &self.config.numgen_params,
+                &mut rand::rng(),
+            ) {
+                Ok(text) => self.numgen_result = text,
+                Err(error) => self.error = Some(error),
+            }
+        }
+        if to_input {
+            self.input = self.numgen_result.clone();
+            self.send_hex = false;
+            self.send_decimal = false;
+        }
+        if copy {
+            ctx.copy_text(self.numgen_result.clone());
+        }
+        if save_file
+            && let Some(path) = rfd::FileDialog::new()
+                .set_file_name("numbers.txt")
+                .save_file()
+            && let Err(error) = fs::write(&path, &self.numgen_result)
+        {
+            self.error = Some(format!("Не удалось сохранить файл: {error}"));
+        }
+    }
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_import;
+        let mut choice = None;
+        egui::Window::new("Импорт данных")
+            .open(&mut open)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Чтение списков команд, макросов и настроек порта из файлов старых форматов. Исходные файлы не изменяются.").color(MUTED));
+                ui.add_space(4.0);
+                if ui.button("Списки с задержками (AddCmd)…").clicked() { choice = Some(ImportKind::AddCmd); }
+                if ui.button("Списки команд (ListConfig, CmdConfig)…").clicked() { choice = Some(ImportKind::ListConfig); }
+                if ui.button("История команд (OldCmdList)…").clicked() { choice = Some(ImportKind::OldCmdList); }
+                if ui.button("Макросы (AddMacros_Cfg)…").clicked() { choice = Some(ImportKind::Macros); }
+                if ui.button("Настройки порта (CnfgTMB)…").clicked() { choice = Some(ImportKind::Settings); }
+                if !self.import_status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&self.import_status).color(ACCENT));
+                }
+            });
+        self.show_import = open;
+        if let Some(kind) = choice
+            && let Some(path) = rfd::FileDialog::new().pick_file()
+        {
+            match self.run_import(kind, &path) {
+                Ok(message) => {
+                    self.import_status = message;
+                    if let Err(error) = self.save_config() {
+                        self.error = Some(format!("Не удалось сохранить настройки: {error}"));
+                    }
+                }
+                Err(error) => self.error = Some(format!("Импорт не выполнен: {error}")),
+            }
+        }
+    }
+    fn free_list_number(&self, used: &mut std::collections::HashSet<u16>) -> Result<u16, String> {
+        let number = (1..=999)
+            .find(|n| !used.contains(n))
+            .ok_or("Нет свободных номеров списков (1–999)")?;
+        used.insert(number);
+        Ok(number)
+    }
+    fn run_import(&mut self, kind: ImportKind, path: &Path) -> Result<String, String> {
+        let bytes = fs::read(path).map_err(|e| format!("не удалось прочитать файл: {e}"))?;
+        match kind {
+            ImportKind::AddCmd | ImportKind::ListConfig => {
+                let lists = if matches!(kind, ImportKind::AddCmd) {
+                    legacy::decode_add_cmd(&bytes)?
+                } else {
+                    legacy::decode_list_config(&bytes)?
+                };
+                let mut used: std::collections::HashSet<u16> =
+                    self.config.command_lists.iter().map(|l| l.number).collect();
+                let mut converted = Vec::new();
+                let mut text_mode = false;
+                for list in &lists {
+                    if !list
+                        .commands
+                        .iter()
+                        .any(|c| c.enabled && !c.body.is_empty())
+                    {
+                        continue;
+                    }
+                    let number = self.free_list_number(&mut used)?;
+                    converted.push(
+                        legacy::to_command_list(list, number)
+                            .map_err(|e| format!("список «{}»: {e}", list.name))?,
+                    );
+                    if !list.send_hex && !list.send_decimal {
+                        text_mode = true;
+                    }
+                }
+                if converted.is_empty() {
+                    return Err("в файле нет активных команд".into());
+                }
+                let count = converted.len();
+                self.config.command_lists.extend(converted);
+                if text_mode {
+                    self.config.send_encoding = text::Encoding::Windows1251;
+                }
+                Ok(format!("Импортировано списков: {count}"))
+            }
+            ImportKind::OldCmdList => {
+                let commands = legacy::decode_old_cmd_list(&bytes)?;
+                if commands.is_empty() {
+                    return Err("в файле нет команд".into());
+                }
+                let mut used: std::collections::HashSet<u16> =
+                    self.config.command_lists.iter().map(|l| l.number).collect();
+                let number = self.free_list_number(&mut used)?;
+                let count = commands.len();
+                self.config.command_lists.push(protocol::CommandList {
+                    number,
+                    name: "История команд".into(),
+                    text: commands.join("\n"),
+                    hex: false,
+                    decimal: false,
+                });
+                self.config.send_encoding = text::Encoding::Windows1251;
+                Ok(format!("Импортировано команд: {count}"))
+            }
+            ImportKind::Macros => {
+                let macros = legacy::decode_add_macros(&bytes)?;
+                let mut added = Vec::new();
+                for imported in macros {
+                    let exists = self
+                        .config
+                        .macros
+                        .iter()
+                        .chain(added.iter())
+                        .any(|m: &Macro| m.name == imported.name && m.value == imported.value);
+                    if !exists {
+                        added.push(Macro {
+                            name: imported.name,
+                            value: imported.value,
+                            hex: imported.hex,
+                            decimal: false,
+                        });
+                    }
+                }
+                if added.is_empty() {
+                    return Err("новых макросов нет: все уже есть в настройках".into());
+                }
+                let count = added.len();
+                self.config.macros.extend(added);
+                Ok(format!("Импортировано макросов: {count}"))
+            }
+            ImportKind::Settings => {
+                let settings = legacy::decode_cnfg_terminal(&bytes)?;
+                self.config.settings.port = settings.port_name;
+                self.config.settings.baud = settings.baud_rate.to_string();
+                self.config.settings.bits = settings.data_bits;
+                self.config.settings.stop_bits = settings.stop_bits;
+                self.config.auto_connect = settings.auto_connect;
+                self.config.auto_log = settings.auto_log;
+                self.config.auto_log_dir = settings.log_dir;
+                let mut note = String::new();
+                match settings.send_mode {
+                    2 => {
+                        self.show_fast_send = true;
+                        note = "; открыта быстрая отправка".into();
+                    }
+                    3 => {
+                        self.wait_for_answer = true;
+                        note = "; включено ожидание ответа".into();
+                    }
+                    4 => note = "; периодическая отправка не включается автоматически".into(),
+                    5 => {
+                        self.config.byte_by_byte = true;
+                        note = "; включена побайтовая отправка".into();
+                    }
+                    _ => {}
+                }
+                if self.connected {
+                    note.push_str("; параметры порта применятся при следующем подключении");
+                }
+                Ok(format!(
+                    "Настройки порта применены: {} бод, {} бит, {} стоп-бит{note}",
+                    settings.baud_rate, settings.data_bits, settings.stop_bits
+                ))
+            }
+        }
+    }
     fn command_lists_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_command_lists;
         let mut remove = None;
         let mut add = false;
         let mut save = false;
         let mut run = None;
+        let mut select = None;
         let mut choose_base = false;
         egui::Window::new("Списки команд").open(&mut open).default_width(620.0).default_height(450.0).show(ctx, |ui| {
             ui.label(RichText::new("В файле команд вызовите список строкой [sendcmdlist:]001. Каждая строка списка — команда или директива.").color(MUTED));
@@ -2280,11 +2836,38 @@ impl Terminal {
                             if ui.button("Удалить").clicked() { remove = Some(index); }
                         });
                         ui.add(egui::TextEdit::multiline(&mut list.text).desired_rows(4).desired_width(f32::INFINITY).hint_text("Команды, по одной на строку"));
+                        ui.menu_button("Выбрать команду…", |ui| {
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                let mut any = false;
+                                for line in list.text.lines() {
+                                    let trimmed = line.trim();
+                                    if trimmed.is_empty()
+                                        || trimmed.starts_with("[delay:]")
+                                        || trimmed.starts_with("[sendfile:]")
+                                        || trimmed.starts_with("[sendcmdlist:]")
+                                        || trimmed.starts_with("[tail:]")
+                                    {
+                                        continue;
+                                    }
+                                    any = true;
+                                    if ui.button(line).clicked() {
+                                        select = Some((line.to_string(), list.hex, list.decimal));
+                                        ui.close();
+                                    }
+                                }
+                                if !any {
+                                    ui.label(RichText::new("Нет команд").color(MUTED));
+                                }
+                            });
+                        });
                     });
                 }
             });
         });
         self.show_command_lists = open;
+        if let Some((text, hex, decimal)) = select {
+            self.select_command(text, hex, decimal);
+        }
         if choose_base && let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.list_base = Some(path);
         }
@@ -2387,6 +2970,8 @@ impl Terminal {
         let mut active = self.emulator_enabled;
         let mut remove = None;
         let mut save = false;
+        let mut import_emul = false;
+        let mut import_replace = false;
         egui::Window::new("Эмулятор ответов").open(&mut open).default_width(720.0).default_height(420.0).show(ctx, |ui| {
             ui.label(RichText::new("Ответ отправляется в порт запроса. В HEX запросе ?? означает любой байт; @1, @2 в ответе подставляют эти байты по порядку.").color(MUTED));
             ui.label(RichText::new("Настройте границу пакета в журнале. Альтернативные ответы выбираются случайно.").color(MUTED));
@@ -2394,6 +2979,8 @@ impl Terminal {
                 ui.checkbox(&mut active, "Включить автоответ");
                 ui.label(RichText::new(format!("В очереди: {}", self.replies.len())).color(MUTED));
                 if ui.button("Добавить правило").clicked() { self.config.emulator_rules.push(emulator::Rule::default()); }
+                if ui.button("Импорт CfgEmul…").on_hover_text("Добавляет правила из файла CfgEmul; таблицы замен берутся из файла CfgReplace в той же папке").clicked() { import_emul = true; }
+                if ui.button("Таблицы замен…").on_hover_text("Применяет файл CfgReplace к правилам, импортированным из CfgEmul").clicked() { import_replace = true; }
                 if ui.button("Сохранить настройки").clicked() { save = true; }
             });
             ui.separator();
@@ -2403,6 +2990,7 @@ impl Terminal {
                         egui::Frame::new().fill(PANEL).corner_radius(8).inner_margin(12).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut rule.enabled, "Включено");
+                                if !rule.list.is_empty() { ui.label(RichText::new(&rule.list).color(MUTED)); }
                                 ui.label("Порт");
                                 ui.add(egui::TextEdit::singleline(&mut rule.port).desired_width(70.0).hint_text("Любой"));
                                 ui.selectable_value(&mut rule.hex, true, "HEX");
@@ -2414,8 +3002,6 @@ impl Terminal {
                                     });
                                 }
                                 ui.checkbox(&mut rule.prefix, "Начало пакета");
-                                ui.label("Задержка, мс");
-                                ui.add(egui::DragValue::new(&mut rule.delay_ms).range(0..=60_000));
                                 if ui.button("Удалить").clicked() { remove = Some(i); }
                             });
                             ui.horizontal(|ui| {
@@ -2440,6 +3026,38 @@ impl Terminal {
                                     ui.add(egui::DragValue::new(&mut rule.checksum_skip).range(0..=65535));
                                 }
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("Задержка, мс").on_hover_text("Ответ отправляется после задержки; при ненулевом максимуме она выбирается случайно в диапазоне");
+                                ui.add(egui::DragValue::new(&mut rule.delay_ms).range(0..=60_000));
+                                ui.label("до");
+                                ui.add(egui::DragValue::new(&mut rule.delay_max_ms).range(0..=60_000));
+                            });
+                            let mut remove_replacement = None;
+                            let mut remove_substitution = None;
+                            ui.collapsing(format!("Замены в ответе ({})", rule.replacements.len()), |ui| {
+                                ui.label(RichText::new("Шаблон заменяется случайно выбранным вариантом без учёта регистра, пока замены продолжаются. В HEX вариант вида $0D$0A задаёт байты.").color(MUTED));
+                                for (ri, replacement) in rule.replacements.iter_mut().enumerate() {
+                                    ui.push_id(ri, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.checkbox(&mut replacement.enabled, "Вкл");
+                                            ui.add(egui::TextEdit::singleline(&mut replacement.template).desired_width(150.0).hint_text("Шаблон"));
+                                            ui.label(RichText::new(format!("вариантов: {}", replacement.substitutions.len())).color(MUTED));
+                                            if ui.button("Удалить замену").clicked() { remove_replacement = Some(ri); }
+                                        });
+                                        for (si, substitution) in replacement.substitutions.iter_mut().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.add(egui::TextEdit::singleline(substitution).desired_width(300.0).hint_text("Вариант"));
+                                                if ui.button("Убрать").clicked() { remove_substitution = Some((ri, si)); }
+                                            });
+                                        }
+                                        if ui.button("Добавить вариант").clicked() { replacement.substitutions.push(String::new()); }
+                                    });
+                                    ui.separator();
+                                }
+                                if ui.button("Добавить замену").clicked() { rule.replacements.push(emulator::Replacement::default()); }
+                            });
+                            if let Some((ri, si)) = remove_substitution { rule.replacements[ri].substitutions.remove(si); }
+                            if let Some(ri) = remove_replacement { rule.replacements.remove(ri); }
                         });
                     });
                 }
@@ -2469,6 +3087,64 @@ impl Terminal {
         }
         if save && let Err(error) = self.save_config() {
             self.error = Some(format!("Не удалось сохранить настройки: {error}"));
+        }
+        if import_emul && let Some(path) = rfd::FileDialog::new().pick_file() {
+            let result = fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| emulator::decode_emulator_config(&bytes));
+            match result {
+                Ok(lists) => {
+                    let tables = fs::read(path.with_file_name("CfgReplace"))
+                        .ok()
+                        .and_then(|bytes| emulator::decode_replace(&bytes).ok());
+                    let mut count = 0;
+                    for (index, list) in lists.iter().enumerate() {
+                        for mut rule in list.rules.clone() {
+                            if let Some(tables) = &tables {
+                                rule.replacements = tables[index].clone();
+                            }
+                            self.config.emulator_rules.push(rule);
+                            count += 1;
+                        }
+                    }
+                    if count == 0 {
+                        self.error = Some("В файле CfgEmul нет активных команд".into());
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(format!("Не удалось импортировать эмулятор: {error}"))
+                }
+            }
+        }
+        if import_replace && let Some(path) = rfd::FileDialog::new().pick_file() {
+            let result = fs::read(path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| emulator::decode_replace(&bytes));
+            match result {
+                Ok(tables) => {
+                    let mut applied = 0;
+                    for rule in &mut self.config.emulator_rules {
+                        let number = rule
+                            .list
+                            .strip_prefix("Список ")
+                            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                            .and_then(|digits| digits.parse::<usize>().ok())
+                            .and_then(|number| number.checked_sub(1));
+                        if let Some(replacements) = number.and_then(|index| tables.get(index)) {
+                            rule.replacements = replacements.clone();
+                            applied += 1;
+                        }
+                    }
+                    if applied == 0 {
+                        self.error = Some(
+                            "Нет правил с номером списка: сначала импортируйте CfgEmul".into(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(format!("Не удалось импортировать таблицы замен: {error}"))
+                }
+            }
         }
     }
     fn extras_window(&mut self, ctx: &egui::Context) {
@@ -2663,13 +3339,16 @@ impl Terminal {
             });
         self.show_extras = open;
         if add {
-            self.extras.push(extra::ExtraPort::new(
-                Settings::default(),
-                self.config.framing,
-                self.config.frame_length,
-                self.config.idle_ms,
-                &self.config.frame_sequence,
-            ));
+            self.extras.push(
+                extra::ExtraPort::new(
+                    Settings::default(),
+                    self.config.framing,
+                    self.config.frame_length,
+                    self.config.idle_ms,
+                    &self.config.frame_sequence,
+                )
+                .with_framing(self.config.frame_combined, &self.config.frame_sequence2),
+            );
         }
         if let Some(action) = action {
             match action {
@@ -2941,6 +3620,14 @@ impl Terminal {
                             self.show_generator = true;
                             ui.close();
                         }
+                        if ui.button("Генератор чисел…").clicked() {
+                            self.show_numgen = true;
+                            ui.close();
+                        }
+                        if ui.button("Быстрая отправка…").clicked() {
+                            self.show_fast_send = true;
+                            ui.close();
+                        }
                         if ui.button("Списки команд…").clicked() {
                             self.show_command_lists = true;
                             ui.close();
@@ -2983,6 +3670,11 @@ impl Terminal {
                         }
                         if ui.button("Дополнительные порты…").clicked() {
                             self.show_extras = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Импорт данных…").clicked() {
+                            self.show_import = true;
                             ui.close();
                         }
                     });
@@ -3128,6 +3820,13 @@ impl Terminal {
                                 ui.checkbox(
                                     &mut self.config.auto_connect,
                                     "Подключать при запуске",
+                                );
+                                ui.checkbox(
+                                    &mut self.config.send_on_connect,
+                                    "Отправлять команду при подключении",
+                                )
+                                .on_hover_text(
+                                    "При каждом успешном подключении отправляется текущая команда из поля ввода с её форматом, окончанием и контрольной суммой",
                                 );
                             },
                         );
@@ -3300,6 +3999,13 @@ impl Terminal {
                     if ui.button("Парсер HEX…").clicked() {
                         self.show_parser = true;
                     }
+                    ui.checkbox(&mut self.config.auto_log, "Автожурнал при подключении");
+                    if self.config.auto_log
+                        && ui.button("Каталог автожурнала…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.config.auto_log_dir = dir.display().to_string();
+                    }
                     if self.log.is_some() {
                         if ui.button("Остановить запись").clicked() {
                             self.log = None;
@@ -3340,6 +4046,7 @@ impl Terminal {
                         self.config.frame_length,
                         self.config.idle_ms,
                     );
+                    let combined_before = self.config.frame_combined;
                     egui::ComboBox::from_id_salt("framing")
                         .selected_text(match self.config.framing {
                             framing::Mode::Raw => "Порции чтения",
@@ -3351,6 +4058,7 @@ impl Terminal {
                             framing::Mode::Idle => "Пауза",
                             framing::Mode::Sequence => "Последовательность",
                             framing::Mode::SequenceStart => "Перед последовательностью",
+                            framing::Mode::Combined => "Комбинированный",
                         })
                         .show_ui(ui, |ui| {
                             for (mode, label) in [
@@ -3363,25 +4071,32 @@ impl Terminal {
                                 (framing::Mode::Idle, "Пауза"),
                                 (framing::Mode::Sequence, "Последовательность"),
                                 (framing::Mode::SequenceStart, "Перед последовательностью"),
+                                (framing::Mode::Combined, "Комбинированный"),
                             ] {
                                 ui.selectable_value(&mut self.config.framing, mode, label);
                             }
                         });
-                    if self.config.framing == framing::Mode::Fixed {
+                    let combined = self.config.framing == framing::Mode::Combined;
+                    if self.config.framing == framing::Mode::Fixed
+                        || (combined && self.config.frame_combined.fixed)
+                    {
                         ui.add(
                             egui::DragValue::new(&mut self.config.frame_length)
                                 .range(1..=1_048_576),
                         );
                         ui.label(RichText::new("байт").color(MUTED));
                     }
-                    if self.config.framing == framing::Mode::Idle {
+                    if self.config.framing == framing::Mode::Idle
+                        || (combined && self.config.frame_combined.idle)
+                    {
                         ui.add(egui::DragValue::new(&mut self.config.idle_ms).range(1..=60_000));
                         ui.label(RichText::new("мс").color(MUTED));
                     }
                     if matches!(
                         self.config.framing,
                         framing::Mode::Sequence | framing::Mode::SequenceStart
-                    ) {
+                    ) || combined
+                    {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.sequence_edit)
                                 .desired_width(120.0)
@@ -3392,6 +4107,30 @@ impl Terminal {
                         {
                             self.error = Some(error);
                         }
+                    }
+                    if combined && self.config.frame_combined.after2 {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sequence2_edit)
+                                .desired_width(120.0)
+                                .hint_text("0D 0A"),
+                        );
+                        if ui.button("Применить разделитель 2").clicked()
+                            && let Err(error) = self.apply_sequence2()
+                        {
+                            self.error = Some(error);
+                        }
+                    }
+                    if combined {
+                        let c = &mut self.config.frame_combined;
+                        ui.checkbox(&mut c.cr, "CR");
+                        ui.checkbox(&mut c.lf, "LF");
+                        ui.checkbox(&mut c.crlf, "CR LF");
+                        ui.checkbox(&mut c.zero, "00");
+                        ui.checkbox(&mut c.fixed, "Число байт");
+                        ui.checkbox(&mut c.idle, "Пауза");
+                        ui.checkbox(&mut c.after1, "После посл. 1");
+                        ui.checkbox(&mut c.after2, "После посл. 2");
+                        ui.checkbox(&mut c.before, "Перед посл. 1");
                     }
                     ui.label(RichText::new("RX* — часть пакета").color(MUTED).small());
                     if self.binary_log.is_some() {
@@ -3474,6 +4213,18 @@ impl Terminal {
                         for (port, frame) in remainder {
                             self.display_record(&port, false, frame.bytes, true);
                         }
+                    }
+                    if combined_before != self.config.frame_combined {
+                        let idle = self.idle_gap();
+                        if let Some(connection) = &self.connection {
+                            let _ = connection.commands.send(Command::SetIdle(idle));
+                        }
+                        for extra in &self.extras {
+                            if let Some(connection) = &extra.connection {
+                                let _ = connection.commands.send(Command::SetIdle(idle));
+                            }
+                        }
+                        self.apply_combined();
                     }
                 });
                 ui.add_space(4.0);
@@ -3648,10 +4399,10 @@ impl Terminal {
                             && self.generator.is_none()
                             && self.file_transfer.is_none())
                     {
-                        self.send_input();
+                        self.send_manual();
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let was_periodic = self.periodic;
                     ui.add_enabled(
                         self.connected
@@ -3662,6 +4413,7 @@ impl Terminal {
                     );
                     if self.periodic && !was_periodic {
                         self.next_send = Instant::now();
+                        self.config.byte_by_byte = false;
                     }
                     ui.add(egui::TextEdit::singleline(&mut self.period_ms).desired_width(65.0));
                     ui.label("мс");
@@ -3669,6 +4421,16 @@ impl Terminal {
                         !self.script.active(),
                         egui::Checkbox::new(&mut self.wait_for_answer, "Ждать ответ"),
                     );
+                    let was_byte_by_byte = self.config.byte_by_byte;
+                    ui.checkbox(&mut self.config.byte_by_byte, "Побайтово")
+                        .on_hover_text(
+                            "«Отправить» передаёт первый байт команды без окончания и контрольной суммы и удаляет его из поля; в тексте — первый символ",
+                        );
+                    if self.config.byte_by_byte && !was_byte_by_byte {
+                        self.periodic = false;
+                    }
+                    ui.checkbox(&mut self.config.send_on_select, "Отправлять при выборе")
+                        .on_hover_text("Выбор макроса или команды из списка сразу отправляет её");
                 });
                 ui.horizontal_wrapped(|ui| {
                     if ui
@@ -3760,6 +4522,7 @@ impl Terminal {
                         }
                     }
                     let mut remove = None;
+                    let mut select = None;
                     if !self.config.macros.is_empty() {
                         egui::ScrollArea::horizontal()
                             .id_salt("macros-scroll")
@@ -3770,9 +4533,8 @@ impl Terminal {
                                             "Нажмите для выбора; правой кнопкой — удалить",
                                         );
                                         if response.clicked() {
-                                            self.input = item.value.clone();
-                                            self.send_hex = item.hex;
-                                            self.send_decimal = item.decimal;
+                                            select =
+                                                Some((item.value.clone(), item.hex, item.decimal));
                                         }
                                         if response.secondary_clicked() {
                                             remove = Some(i);
@@ -3780,6 +4542,9 @@ impl Terminal {
                                     }
                                 });
                             });
+                    }
+                    if let Some((value, hex, decimal)) = select {
+                        self.select_command(value, hex, decimal);
                     }
                     if let Some(i) = remove {
                         self.config.macros.remove(i);
@@ -3824,6 +4589,12 @@ impl Terminal {
         if self.show_generator {
             self.generator_window(ctx);
         }
+        if self.show_numgen {
+            self.numgen_window(ctx);
+        }
+        if self.show_import {
+            self.import_window(ctx);
+        }
         if self.show_command_lists {
             self.command_lists_window(ctx);
         }
@@ -3841,6 +4612,9 @@ impl Terminal {
         }
         if self.show_ascii {
             self.ascii_window(ctx);
+        }
+        if self.show_fast_send {
+            self.fast_send_window(ctx);
         }
         if self.show_custom_table {
             self.custom_table_window(ctx);
@@ -4330,6 +5104,7 @@ mod tests {
         app.show_byte_options = true;
         app.show_profiles = true;
         app.show_ascii = true;
+        app.show_fast_send = true;
         app.show_custom_table = true;
         app.show_compare = true;
         let profile = app.snapshot_profile("Стенд".into());
@@ -4400,6 +5175,194 @@ mod tests {
         app.write_pending = false;
         assert!(app.send_scheduled("COM2", vec![1]).is_ok());
         assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [1]));
+    }
+    #[test]
+    fn connect_event_sends_current_command_when_enabled() {
+        let ctx = egui::Context::default();
+        let mut config = Config {
+            send_on_connect: true,
+            ..Config::default()
+        };
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        app.input = "01 02".into();
+        app.send_hex = true;
+        app.suffix = 2;
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        received.send(Event::Connected).unwrap();
+        app.receive_events();
+        assert!(app.connected);
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [1, 2, b'\n']));
+        assert!(app.write_pending);
+    }
+    #[test]
+    fn connect_event_does_not_send_when_disabled() {
+        let ctx = egui::Context::default();
+        let mut config = Config::default();
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        app.input = "01".into();
+        app.send_hex = true;
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        received.send(Event::Connected).unwrap();
+        app.receive_events();
+        assert!(app.connected);
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn connect_event_skips_empty_command_without_error() {
+        let ctx = egui::Context::default();
+        let mut config = Config {
+            send_on_connect: true,
+            ..Config::default()
+        };
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        received.send(Event::Connected).unwrap();
+        app.receive_events();
+        assert!(sent.try_recv().is_err());
+        assert!(app.error.is_none());
+    }
+    #[test]
+    fn selecting_command_sends_when_enabled() {
+        let ctx = egui::Context::default();
+        let mut config = Config {
+            send_on_select: true,
+            ..Config::default()
+        };
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.select_command("01 02".into(), true, false);
+        assert_eq!(app.input, "01 02");
+        assert!(app.send_hex);
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [1, 2]));
+    }
+    #[test]
+    fn selecting_command_only_fills_input_when_disabled() {
+        let ctx = egui::Context::default();
+        let mut config = Config::default();
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.select_command("10 20".into(), false, true);
+        assert_eq!(app.input, "10 20");
+        assert!(app.send_decimal);
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn send_mode_flags_default_for_legacy_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.send_on_connect);
+        assert!(!config.send_on_select);
+        assert!(!config.byte_by_byte);
+    }
+    #[test]
+    fn byte_by_byte_sends_one_token_without_tail_and_consumes_input() {
+        let ctx = egui::Context::default();
+        let mut config = Config {
+            byte_by_byte: true,
+            send_checksum: checksum::Kind::Sum,
+            ..Config::default()
+        };
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        app.input = "01 02".into();
+        app.send_hex = true;
+        app.suffix = 3;
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.send_manual();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [1]));
+        assert_eq!(app.input, "02");
+        app.write_pending = false;
+        app.send_manual();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [2]));
+        assert_eq!(app.input, "");
+        app.write_pending = false;
+        app.send_manual();
+        assert!(sent.try_recv().is_err());
+        assert!(app.error.is_some());
+    }
+    #[test]
+    fn byte_by_byte_text_consumes_first_character() {
+        let ctx = egui::Context::default();
+        let mut config = Config {
+            byte_by_byte: true,
+            ..Config::default()
+        };
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        app.input = "AB".into();
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.send_manual();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [b'A']));
+        assert_eq!(app.input, "B");
+    }
+    #[test]
+    fn fast_send_transmits_only_new_characters() {
+        let ctx = egui::Context::default();
+        let mut config = Config::default();
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.fast_send_text = "AB".into();
+        app.flush_fast_send();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [65, 66]));
+        app.write_pending = false;
+        app.fast_send_text.push('C');
+        app.flush_fast_send();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [67]));
+        app.write_pending = false;
+        app.fast_send_text = "X".into();
+        app.flush_fast_send();
+        assert!(sent.try_recv().is_err());
+        assert_eq!(app.fast_send_baseline, "X");
+    }
+    #[test]
+    fn fast_send_waits_for_write_and_discards_when_disconnected() {
+        let ctx = egui::Context::default();
+        let mut config = Config::default();
+        config.settings.port = "COM2".into();
+        let mut app = Terminal::from_config(&ctx, config, None);
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (_received, events) = std::sync::mpsc::sync_channel(8);
+        app.connection = Some(Connection { commands, events });
+        app.connected = true;
+        app.write_pending = true;
+        app.fast_send_text = "A".into();
+        app.flush_fast_send();
+        assert!(sent.try_recv().is_err());
+        assert_eq!(app.fast_send_baseline, "");
+        app.write_pending = false;
+        app.flush_fast_send();
+        assert!(matches!(sent.try_recv(), Ok(Command::Send(bytes)) if bytes == [65]));
+        app.connected = false;
+        app.fast_send_text = "AB".into();
+        app.flush_fast_send();
+        assert!(sent.try_recv().is_err());
+        assert_eq!(app.fast_send_baseline, "AB");
     }
     #[test]
     fn binary_log_preserves_transmitted_and_received_bytes() {

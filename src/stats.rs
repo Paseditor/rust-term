@@ -82,6 +82,55 @@ impl Stats {
     }
 }
 
+const ZERO: [u64; 256] = [0; 256];
+
+#[derive(Default)]
+pub struct ByteFrequency {
+    rx: BTreeMap<String, [u64; 256]>,
+    tx: BTreeMap<String, [u64; 256]>,
+}
+
+impl ByteFrequency {
+    pub fn observe(&mut self, port: &str, outgoing: bool, bytes: &[u8]) {
+        let key = port.to_ascii_uppercase();
+        let counters = if outgoing {
+            self.tx.entry(key).or_insert_with(|| [0; 256])
+        } else {
+            self.rx.entry(key).or_insert_with(|| [0; 256])
+        };
+        for &byte in bytes {
+            counters[byte as usize] += 1;
+        }
+    }
+    pub fn rx(&self, port: &str) -> &[u64; 256] {
+        self.rx.get(&port.to_ascii_uppercase()).unwrap_or(&ZERO)
+    }
+    pub fn tx(&self, port: &str) -> &[u64; 256] {
+        self.tx.get(&port.to_ascii_uppercase()).unwrap_or(&ZERO)
+    }
+    pub fn reset(&mut self, port: Option<&str>) {
+        match port {
+            Some(port) => {
+                let key = port.to_ascii_uppercase();
+                self.rx.remove(&key);
+                self.tx.remove(&key);
+            }
+            None => {
+                self.rx.clear();
+                self.tx.clear();
+            }
+        }
+    }
+    pub fn ports(&self) -> impl Iterator<Item = &str> {
+        self.rx
+            .keys()
+            .chain(self.tx.keys())
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +157,54 @@ mod tests {
         );
         assert_eq!((port.tx_writes, port.tx_bytes), (1, 12));
         assert_eq!(stats.matches[0]["COM2"], 1);
+    }
+    #[test]
+    fn byte_frequency_counts_direction_port_and_case_insensitive() {
+        let mut freq = ByteFrequency::default();
+        freq.observe("com2", false, &[0xaa, 0xbb, 0xaa]);
+        freq.observe("COM2", false, &[0xaa]);
+        freq.observe("com2", true, &[0xbb, 0xbb]);
+        freq.observe("com3", false, &[0x00, 0xff]);
+        assert_eq!(freq.rx("COM2")[0xaa], 3);
+        assert_eq!(freq.rx("com2")[0xbb], 1);
+        assert_eq!(freq.tx("com2")[0xbb], 2);
+        assert_eq!(freq.tx("COM2")[0xaa], 0);
+        assert_eq!(freq.rx("com3")[0x00], 1);
+        assert_eq!(freq.rx("com3")[0xff], 1);
+        assert_eq!(freq.rx("com3")[0xaa], 0);
+    }
+    #[test]
+    fn byte_frequency_reset_one_port_vs_all() {
+        let mut freq = ByteFrequency::default();
+        freq.observe("com1", false, &[1, 1]);
+        freq.observe("com1", true, &[2]);
+        freq.observe("com2", false, &[3]);
+        freq.reset(Some("COM1"));
+        assert_eq!(freq.rx("com1")[1], 0);
+        assert_eq!(freq.tx("com1")[2], 0);
+        assert_eq!(freq.rx("com2")[3], 1);
+        assert!(!freq.ports().any(|p| p == "COM1"));
+        freq.reset(None);
+        assert_eq!(freq.rx("com2")[3], 0);
+        assert_eq!(freq.ports().count(), 0);
+    }
+    #[test]
+    fn byte_frequency_unknown_port_returns_zeros() {
+        let freq = ByteFrequency::default();
+        assert_eq!(freq.rx("nope"), &[0u64; 256]);
+        assert_eq!(freq.tx("nope"), &[0u64; 256]);
+        let mut freq = ByteFrequency::default();
+        freq.observe("com1", false, &[5]);
+        assert_eq!(freq.rx("unknown")[5], 0);
+        assert_eq!(freq.ports().count(), 1);
+    }
+    #[test]
+    fn byte_frequency_ports_lists_seen_ports() {
+        let mut freq = ByteFrequency::default();
+        freq.observe("com5", false, &[1]);
+        freq.observe("com2", true, &[2]);
+        freq.observe("COM5", false, &[3]);
+        let ports: Vec<&str> = freq.ports().collect();
+        assert_eq!(ports, vec!["COM2", "COM5"]);
     }
 }

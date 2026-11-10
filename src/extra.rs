@@ -28,4 +28,9 @@ impl ExtraPort {
             framer,
         }
     }
+    pub fn with_framing(mut self, combined: crate::framing::Combined, sequence2: &[u8]) -> Self {
+        self.framer.set_combined(combined);
+        self.framer.set_sequence2(sequence2);
+        self
+    }
 }
