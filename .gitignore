@@ -1,0 +1,14 @@
+/target/
+
+# Локальные рабочие заметки и пользовательские данные
+/PORTING_STATUS.md
+.env
+.env.*
+*.log
+
+# Файлы редакторов и Windows
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
